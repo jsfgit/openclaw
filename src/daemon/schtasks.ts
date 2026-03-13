@@ -176,6 +176,38 @@ export function parseSchtasksQuery(output: string): ScheduledTaskInfo {
   return info;
 }
 
+/**
+ * Parse PowerShell JSON output from Get-ScheduledTask.
+ * PowerShell returns structured data with locale-independent numeric State codes.
+ * State codes: 0=Unknown, 1=Disabled, 2=Queued, 3=Ready, 4=Running
+ */
+export function parseScheduledTaskFromJson(jsonOutput: string): ScheduledTaskInfo {
+  const info: ScheduledTaskInfo = {};
+  try {
+    const parsed = JSON.parse(jsonOutput);
+    // PowerShell returns State as numeric code (locale-independent)
+    // Map to English status string for consistency
+    if (parsed.State !== undefined) {
+      const stateCode = Number(parsed.State);
+      const stateMap: Record<number, string> = {
+        0: "Unknown",
+        1: "Disabled",
+        2: "Queued",
+        3: "Ready",
+        4: "Running",
+      };
+      info.status = stateMap[stateCode] || `Unknown (${stateCode})`;
+    }
+    // LastRunResult is a numeric code (locale-independent, same as schtasks)
+    if (parsed.LastRunResult !== undefined && parsed.LastRunResult !== null) {
+      info.lastRunResult = String(parsed.LastRunResult);
+    }
+  } catch {
+    // JSON parse failed, return empty info
+  }
+  return info;
+}
+
 function normalizeTaskResultCode(value?: string): string | null {
   if (!value) {
     return null;
@@ -543,7 +575,10 @@ export async function readScheduledTaskRuntime(
     };
   }
   const taskName = resolveTaskName(env);
-  const res = await execSchtasks(["/Query", "/TN", taskName, "/V", "/FO", "LIST"]);
+  // Use PowerShell to avoid locale-specific field names in schtasks output
+  // Get-ScheduledTask returns structured data with English property names
+  const psScript = `Get-ScheduledTask -TaskName "${taskName.replace(/"/g, '`"')}" | Select-Object State,LastRunResult | ConvertTo-Json`;
+  const res = await execSchtasks(["/C", "powershell", "-NoProfile", "-Command", psScript]);
   if (res.code !== 0) {
     if (await isStartupEntryInstalled(env)) {
       return await resolveFallbackRuntime(env);
@@ -556,7 +591,8 @@ export async function readScheduledTaskRuntime(
       missingUnit: missing,
     };
   }
-  const parsed = parseSchtasksQuery(res.stdout || "");
+  // Parse PowerShell JSON output
+  const parsed = parseScheduledTaskFromJson(res.stdout || "");
   const derived = deriveScheduledTaskRuntimeStatus(parsed);
   return {
     status: derived.status,
